@@ -21,6 +21,7 @@
 #include <mavros/plugin_filter.hpp>
 
 #include <mavros_msgs/msg/manual_control.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 
 namespace mavros
 {
@@ -43,6 +44,10 @@ public:
       node->create_subscription<mavros_msgs::msg::ManualControl>(
       "~/send", 10,
       std::bind(&ManualControlPlugin::send_cb, this, _1));
+    normalized_twist_sub =
+      node->create_subscription<geometry_msgs::msg::Twist>(
+        "~/send_normalized_twist", 10,
+        std::bind(&ManualControlPlugin::send_normalized_twist_cb, this, _1));
   }
 
   Subscriptions get_subscriptions() override
@@ -55,6 +60,12 @@ public:
 private:
   rclcpp::Publisher<mavros_msgs::msg::ManualControl>::SharedPtr control_pub;
   rclcpp::Subscription<mavros_msgs::msg::ManualControl>::SharedPtr send_sub;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr normalized_twist_sub;
+
+  // Helper function to clamp values between -1.0 and 1.0
+  double clamp_control_value(double value) {
+    return std::max(-1.0, std::min(1.0, value));
+  }
 
   /* -*- rx handlers -*- */
 
@@ -108,6 +119,33 @@ private:
     msg.aux4 = req->aux4;
     msg.aux5 = req->aux5;
     msg.aux6 = req->aux6;
+
+    uas->send_message(msg);
+  }
+
+  void send_normalized_twist_cb(const geometry_msgs::msg::Twist::SharedPtr req)
+  {
+    mavlink::common::msg::MANUAL_CONTROL msg = {};
+    msg.target = uas->get_tgt_system();
+
+    
+
+    msg.x = static_cast<int16_t>(req->linear.x * 1000);
+    msg.y = static_cast<int16_t>(req->linear.y * 1000);
+    msg.z = static_cast<int16_t>(req->linear.z * 500 + 500);
+    msg.r = static_cast<int16_t>(req->angular.z * 1000);
+
+    msg.buttons = 0;
+    msg.buttons2 = 0;
+    msg.enabled_extensions = 0;
+    msg.s = 0;
+    msg.t = 0;
+    msg.aux1 = 0;
+    msg.aux2 = 0;
+    msg.aux3 = 0;
+    msg.aux4 = 0;
+    msg.aux5 = 0;
+    msg.aux6 = 0;
 
     uas->send_message(msg);
   }
