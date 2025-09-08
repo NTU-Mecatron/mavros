@@ -9,7 +9,6 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 
-#include <atomic>
 #include <mutex>
 
 namespace mavros
@@ -31,13 +30,13 @@ class RemapSetpointVelocityPlugin : public plugin::Plugin,
 public:
   explicit RemapSetpointVelocityPlugin(plugin::UASPtr uas_)
   : Plugin(uas_, "remap_setpoint_velocity"),
-    cur_vel_x(0.0f),
-    cur_vel_y(0.0f), 
-    cur_vel_z(0.0f),
-    cur_vel_r(0.0f),
-    active_(false)
+    reset_timeout_(1.0)
   {
     enable_node_watch_parameters();
+    node_declare_and_watch_parameter(
+    "remap_setpoint_vel_reset_timeout_", 1.0, [&](const rclcpp::Parameter & p) {
+      reset_timeout_ = p.as_double();      
+    });
 
     auto sensor_qos = rclcpp::SensorDataQoS();
 
@@ -47,58 +46,41 @@ public:
     vel_x_sub_ = node->create_subscription<std_msgs::msg::Float32>(
       "setpoint_velocity/cmd_vel_unstamped/x", sensor_qos, 
       [this](const std_msgs::msg::Float32::SharedPtr msg) {
-        cur_vel_x.store(msg->data, std::memory_order_release);
-        {
-          std::lock_guard<std::mutex> lock(time_mutex_);
-          last_vel_x_time_ = node->now();
-        }
-        active_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex_);
+        twist_.linear.x = msg->data;
+        last_vel_x_time_ = node->now();
       });
 
     vel_y_sub_ = node->create_subscription<std_msgs::msg::Float32>(
       "setpoint_velocity/cmd_vel_unstamped/y", sensor_qos,
       [this](const std_msgs::msg::Float32::SharedPtr msg) {
-        cur_vel_y.store(msg->data, std::memory_order_release);
-        {
-          std::lock_guard<std::mutex> lock(time_mutex_);
-          last_vel_y_time_ = node->now();
-        }
-        active_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex_);
+        twist_.linear.y = msg->data;
+        last_vel_y_time_ = node->now();
       });
 
     vel_z_sub_ = node->create_subscription<std_msgs::msg::Float32>(
       "setpoint_velocity/cmd_vel_unstamped/z", sensor_qos,
       [this](const std_msgs::msg::Float32::SharedPtr msg) {
-        cur_vel_z.store(msg->data, std::memory_order_release);
-        {
-          std::lock_guard<std::mutex> lock(time_mutex_);
-          last_vel_z_time_ = node->now();
-        }
-        active_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex_);
+        twist_.linear.z = msg->data;
+        last_vel_z_time_ = node->now();
       });
 
     vel_r_sub_ = node->create_subscription<std_msgs::msg::Float32>(
       "setpoint_velocity/cmd_vel_unstamped/r", sensor_qos,
       [this](const std_msgs::msg::Float32::SharedPtr msg) {
-        cur_vel_r.store(msg->data, std::memory_order_release);
-        {
-          std::lock_guard<std::mutex> lock(time_mutex_);
-          last_vel_r_time_ = node->now();
-        }
-        active_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex_);
+        twist_.angular.z = msg->data;
+        last_vel_r_time_ = node->now();
       });
 
-    // Timer for timeout checking
-    timeout_timer_ = node->create_wall_timer(
-      std::chrono::milliseconds(100),
-      [this]() { check_timeout(); });
-
-    // Timer for publishing at 40 Hz
-    publish_timer_ = node->create_wall_timer(
-      std::chrono::milliseconds(25), // 25ms = 40 Hz
-      [this]() { 
-        if (active_.load(std::memory_order_acquire)) {
-          send_setpoint_velocity();
+    publish_timer_ = rclcpp::create_timer(
+      node, node->get_clock(), rclcpp::Duration::from_seconds(0.1),
+      [this]() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (is_any_active()) {
+          twist_pub_->publish(twist_);
         }
       });
 
@@ -107,6 +89,14 @@ public:
     last_vel_y_time_ = now;
     last_vel_z_time_ = now;
     last_vel_r_time_ = now;
+
+    // Initialize twist message
+    twist_.linear.x = 0.0;
+    twist_.linear.y = 0.0;
+    twist_.linear.z = 0.0;
+    twist_.angular.x = 0.0;
+    twist_.angular.y = 0.0;
+    twist_.angular.z = 0.0;
   }
 
   ~RemapSetpointVelocityPlugin() = default;
@@ -123,88 +113,50 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_z_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_r_sub_;
   
-  std::atomic<float> cur_vel_x;
-  std::atomic<float> cur_vel_y;
-  std::atomic<float> cur_vel_z;
-  std::atomic<float> cur_vel_r;
+  geometry_msgs::msg::Twist twist_;
 
-  std::atomic<bool> active_;
-  
   // Timeout management (protected by mutex for thread safety)
-  std::mutex time_mutex_;
+  std::mutex mutex_;
   rclcpp::Time last_vel_x_time_;
   rclcpp::Time last_vel_y_time_;
   rclcpp::Time last_vel_z_time_;
   rclcpp::Time last_vel_r_time_;
-  rclcpp::TimerBase::SharedPtr timeout_timer_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
 
-  static constexpr double COMPONENT_TIMEOUT_ = 0.5;
+  double reset_timeout_;
 
   /* -*- mid-level helpers -*- */
 
-  /**
-   * @brief Send combined velocity setpoint to MAVROS
-   * 
-   * @warning Send only VX VY VZ and RZ
-   */
-  void send_setpoint_velocity()
+  bool is_any_active()
   {
-    geometry_msgs::msg::Twist twist;
-
-    twist.linear.x = cur_vel_x.load(std::memory_order_acquire);
-    twist.linear.y = cur_vel_y.load(std::memory_order_acquire);
-    twist.linear.z = cur_vel_z.load(std::memory_order_acquire);
-    twist.angular.z = cur_vel_r.load(std::memory_order_acquire);
-
-    twist_pub_->publish(twist);
-  }
-
-  /**
-   * @brief Check timeout for each component (axis) topics. 
-   * For each axis, if there is no new msg in 0.5s, it will set buffer to 0 
-   * 
-   * @warning Send only VX VY VZ and RZ
-   */
-  void check_timeout()
-  {
-    if (!active_.load(std::memory_order_acquire))
-      return;
-
     rclcpp::Time current_time = node->now();
     bool any_active = false;
-    {
-      std::lock_guard<std::mutex> lock(time_mutex_);
-      
-      if ((current_time - last_vel_x_time_).seconds() > COMPONENT_TIMEOUT_) {
-        cur_vel_x.store(0.0f, std::memory_order_release);
-      } else {
-        any_active = true;
-      }
-      
-      if ((current_time - last_vel_y_time_).seconds() > COMPONENT_TIMEOUT_) {
-        cur_vel_y.store(0.0f, std::memory_order_release);
-      } else {
-        any_active = true;
-      }
-      
-      if ((current_time - last_vel_z_time_).seconds() > COMPONENT_TIMEOUT_) {
-        cur_vel_z.store(0.0f, std::memory_order_release);
-      } else {
-        any_active = true;
-      }
-      
-      if ((current_time - last_vel_r_time_).seconds() > COMPONENT_TIMEOUT_) {
-        cur_vel_r.store(0.0f, std::memory_order_release);
-      } else {
-        any_active = true;
-      }
+    
+    if ((current_time - last_vel_x_time_).seconds() > reset_timeout_) {
+      twist_.linear.x = 0.0;
+    } else {
+      any_active = true;
+    }
+    
+    if ((current_time - last_vel_y_time_).seconds() > reset_timeout_) {
+      twist_.linear.y = 0.0;
+    } else {
+      any_active = true;
+    }
+    
+    if ((current_time - last_vel_z_time_).seconds() > reset_timeout_) {
+      twist_.linear.z = 0.0;
+    } else {
+      any_active = true;
+    }
+    
+    if ((current_time - last_vel_r_time_).seconds() > reset_timeout_) {
+      twist_.angular.z = 0.0;
+    } else {
+      any_active = true;
     }
 
-    if (!any_active) {
-      RCLCPP_WARN(get_logger(), "All velocity components timed out - stopping");
-      active_.store(false, std::memory_order_release);
-    }
+    return any_active;
   }
 };
 
