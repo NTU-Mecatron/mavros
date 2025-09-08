@@ -9,7 +9,6 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 
-#include <thread>
 #include <atomic>
 #include <mutex>
 
@@ -36,55 +35,81 @@ public:
     cur_vel_y(0.0f), 
     cur_vel_z(0.0f),
     cur_vel_r(0.0f),
-    run_publisher_(true),
-    active_(false),
-    COMPONENT_TIMEOUT_(0.2)
+    active_(false)
   {
     enable_node_watch_parameters();
 
     auto sensor_qos = rclcpp::SensorDataQoS();
 
     twist_pub_ = node->create_publisher<geometry_msgs::msg::Twist>(
-      "/mavros/setpoint_velocity/cmd_vel_unstamped", 10);
+      "setpoint_velocity/cmd_vel_unstamped", 10);
       
     vel_x_sub_ = node->create_subscription<std_msgs::msg::Float32>(
-      "~/vel_x", sensor_qos, 
-      std::bind(&RemapSetpointVelocityPlugin::setpoint_vel_x_cb, this, _1));
+      "setpoint_velocity/cmd_vel_unstamped/x", sensor_qos, 
+      [this](const std_msgs::msg::Float32::SharedPtr msg) {
+        cur_vel_x.store(msg->data, std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> lock(time_mutex_);
+          last_vel_x_time_ = node->now();
+        }
+        active_.store(true, std::memory_order_release);
+      });
 
     vel_y_sub_ = node->create_subscription<std_msgs::msg::Float32>(
-      "~/vel_y", sensor_qos,
-      std::bind(&RemapSetpointVelocityPlugin::setpoint_vel_y_cb, this, _1));
+      "setpoint_velocity/cmd_vel_unstamped/y", sensor_qos,
+      [this](const std_msgs::msg::Float32::SharedPtr msg) {
+        cur_vel_y.store(msg->data, std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> lock(time_mutex_);
+          last_vel_y_time_ = node->now();
+        }
+        active_.store(true, std::memory_order_release);
+      });
 
     vel_z_sub_ = node->create_subscription<std_msgs::msg::Float32>(
-      "~/vel_z", sensor_qos,
-      std::bind(&RemapSetpointVelocityPlugin::setpoint_vel_z_cb, this, _1));
+      "setpoint_velocity/cmd_vel_unstamped/z", sensor_qos,
+      [this](const std_msgs::msg::Float32::SharedPtr msg) {
+        cur_vel_z.store(msg->data, std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> lock(time_mutex_);
+          last_vel_z_time_ = node->now();
+        }
+        active_.store(true, std::memory_order_release);
+      });
 
     vel_r_sub_ = node->create_subscription<std_msgs::msg::Float32>(
-      "~/vel_r", sensor_qos,
-      std::bind(&RemapSetpointVelocityPlugin::setpoint_vel_r_cb, this, _1));
+      "setpoint_velocity/cmd_vel_unstamped/r", sensor_qos,
+      [this](const std_msgs::msg::Float32::SharedPtr msg) {
+        cur_vel_r.store(msg->data, std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> lock(time_mutex_);
+          last_vel_r_time_ = node->now();
+        }
+        active_.store(true, std::memory_order_release);
+      });
 
-    // Timer
+    // Timer for timeout checking
     timeout_timer_ = node->create_wall_timer(
       std::chrono::milliseconds(100),
       [this]() { check_timeout(); });
+
+    // Timer for publishing at 40 Hz
+    publish_timer_ = node->create_wall_timer(
+      std::chrono::milliseconds(25), // 25ms = 40 Hz
+      [this]() { 
+        if (active_.load(std::memory_order_acquire)) {
+          send_setpoint_velocity();
+        }
+      });
 
     auto now = node->now();
     last_vel_x_time_ = now;
     last_vel_y_time_ = now;
     last_vel_z_time_ = now;
     last_vel_r_time_ = now;
-
-    // Start publisher thread
-    publisher_thread_ = std::thread(&RemapSetpointVelocityPlugin::publish_loop, this);
   }
 
-  ~RemapSetpointVelocityPlugin()
-  {
-    run_publisher_.store(false);
-    if (publisher_thread_.joinable()) {
-      publisher_thread_.join();
-    }
-  }
+  ~RemapSetpointVelocityPlugin() = default;
 
   Subscriptions get_subscriptions() override
   {
@@ -92,8 +117,6 @@ public:
   }
 
 private:
-  friend class plugin::SetPositionTargetLocalNEDMixin<RemapSetpointVelocityPlugin>;
-
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_x_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_y_sub_;
@@ -105,8 +128,6 @@ private:
   std::atomic<float> cur_vel_z;
   std::atomic<float> cur_vel_r;
 
-  std::thread publisher_thread_;
-  std::atomic<bool> run_publisher_;
   std::atomic<bool> active_;
   
   // Timeout management (protected by mutex for thread safety)
@@ -116,21 +137,11 @@ private:
   rclcpp::Time last_vel_z_time_;
   rclcpp::Time last_vel_r_time_;
   rclcpp::TimerBase::SharedPtr timeout_timer_;
+  rclcpp::TimerBase::SharedPtr publish_timer_;
 
-  const double COMPONENT_TIMEOUT_;
+  static constexpr double COMPONENT_TIMEOUT_ = 0.5;
 
-  void publish_loop()
-  {
-    rclcpp::Rate rate(40); // 40 Hz publishing rate
-    
-    while (rclcpp::ok() && run_publisher_.load(std::memory_order_acquire))
-    {
-      if (active_.load(std::memory_order_acquire)) {
-        send_setpoint_velocity();
-      }
-      rate.sleep();
-    }
-  }
+  /* -*- mid-level helpers -*- */
 
   /**
    * @brief Send combined velocity setpoint to MAVROS
@@ -149,10 +160,14 @@ private:
     twist_pub_->publish(twist);
   }
 
+  /**
+   * @brief Check timeout for each component (axis) topics. 
+   * For each axis, if there is no new msg in 0.5s, it will set buffer to 0 
+   * 
+   * @warning Send only VX VY VZ and RZ
+   */
   void check_timeout()
   {
-    // Timeout for each axis
-    // If every axis receives no message, then stops publishing
     if (!active_.load(std::memory_order_acquire))
       return;
 
@@ -188,50 +203,8 @@ private:
 
     if (!any_active) {
       RCLCPP_WARN(get_logger(), "All velocity components timed out - stopping");
-      std::cout << "Stopped publishing" << std::endl;
       active_.store(false, std::memory_order_release);
     }
-  }
-
-  /* -*- callbacks -*- */
-  void setpoint_vel_x_cb(const std_msgs::msg::Float32::SharedPtr vel_x)
-  {
-    cur_vel_x.store(vel_x->data, std::memory_order_release);
-    {
-      std::lock_guard<std::mutex> lock(time_mutex_);
-      last_vel_x_time_ = node->now();
-    }
-    active_.store(true, std::memory_order_release);
-  }
-
-  void setpoint_vel_y_cb(const std_msgs::msg::Float32::SharedPtr vel_y)
-  {
-    cur_vel_y.store(vel_y->data, std::memory_order_release);
-    {
-      std::lock_guard<std::mutex> lock(time_mutex_);
-      last_vel_y_time_ = node->now();
-    }
-    active_.store(true, std::memory_order_release);
-  }
-
-  void setpoint_vel_z_cb(const std_msgs::msg::Float32::SharedPtr vel_z)
-  {
-    cur_vel_z.store(vel_z->data, std::memory_order_release);
-    {
-      std::lock_guard<std::mutex> lock(time_mutex_);
-      last_vel_z_time_ = node->now();
-    }
-    active_.store(true, std::memory_order_release);
-  }
-
-  void setpoint_vel_r_cb(const std_msgs::msg::Float32::SharedPtr vel_r)
-  {
-    cur_vel_r.store(vel_r->data, std::memory_order_release);
-    {
-      std::lock_guard<std::mutex> lock(time_mutex_);
-      last_vel_r_time_ = node->now();
-    }
-    active_.store(true, std::memory_order_release);
   }
 };
 
