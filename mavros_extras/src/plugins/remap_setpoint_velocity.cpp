@@ -24,7 +24,8 @@ class RemapSetpointVelocityPlugin :
 public:
   explicit RemapSetpointVelocityPlugin(plugin::UASPtr uas_)
   : Plugin(uas_, "remap_setpoint_velocity"),
-    reset_timeout_(1.0)
+    reset_timeout_(1.0),
+    is_active_(false)
   {
     enable_node_watch_parameters();
 
@@ -100,6 +101,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_r_sub_;
 
     geometry_msgs::msg::Twist twist_;
+    bool is_active_;
     std::mutex mutex_;
     rclcpp::Time last_vel_x_time_;
     rclcpp::Time last_vel_y_time_;
@@ -110,27 +112,39 @@ private:
 
     void publisher_timer_cb() {
       geometry_msgs::msg::Twist twist_copy;
-
+      bool any_active = false;
+      
       {
         std::lock_guard<std::mutex> lock(mutex_);
         rclcpp::Time current_time = node->now();
 
-
         if ((current_time - last_vel_x_time_).seconds() > reset_timeout_)
           twist_.linear.x = 0.0;
+        else
+          any_active = true;
 
         if ((current_time - last_vel_y_time_).seconds() > reset_timeout_)
           twist_.linear.y = 0.0;
+        else
+          any_active = true;
 
         if ((current_time - last_vel_z_time_).seconds() > reset_timeout_)
           twist_.linear.z = 0.0;
-
+        else
+          any_active = true;
+         
         if ((current_time - last_vel_r_time_).seconds() > reset_timeout_)
           twist_.angular.z = 0.0;
-
+        else
+          any_active = true;
+        
         twist_copy = twist_;
       }
 
+      if (!any_active && !is_active_)
+        return;
+      
+      is_active_ = any_active;
       twist_pub_->publish(twist_copy);
     }
 };
